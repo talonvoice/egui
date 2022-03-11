@@ -254,6 +254,11 @@ impl Painter {
             glow::ONE,
         );
 
+        if !cfg!(target_arch = "wasm32") {
+            gl.enable(glow::FRAMEBUFFER_SRGB);
+            check_for_gl_error(gl, "gl.enable(glow::FRAMEBUFFER_SRGB)");
+        }
+
         let width_in_points = width_in_pixels as f32 / pixels_per_point;
         let height_in_points = height_in_pixels as f32 / pixels_per_point;
 

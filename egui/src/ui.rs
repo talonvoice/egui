@@ -10,6 +10,62 @@ use crate::{
 
 // ----------------------------------------------------------------------------
 
+pub struct ContextManager<'a> {
+    f: Option<Box<dyn FnOnce(&mut Self)>>,
+    parent: &'a mut Ui,
+    ui: Ui,
+    response: Option<Response>,
+}
+
+use core::fmt::Debug;
+impl Debug for ContextManager<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "ContextManager{{parent={:?}, ui={:?}, response={:?}}}",
+               self.parent.id, self.ui.id, self.response)
+    }
+}
+
+impl<'a> ContextManager<'a> {
+    fn new(
+        f: impl FnOnce(&mut Self) + 'static,
+        parent: &'a mut Ui,
+        ui: Ui,
+    ) -> ContextManager<'_> {
+        ContextManager{f: Some(Box::new(f)), parent, ui, response: None}
+    }
+
+    fn exit(&mut self) {
+        if let Some(f) = self.f.take() {
+            println!("exit!");
+            f(self);
+        }
+    }
+
+    fn exit_response(&mut self) -> Option<Response> {
+        if let Some(f) = self.f.take() {
+            f(self);
+        }
+        self.response.take()
+    }
+
+    fn exit_callback<R>(
+        &mut self,
+        add_contents: impl FnOnce(&mut Ui) -> R,
+    ) -> InnerResponse<R> {
+        let ret = add_contents(&mut self.ui);
+        let response = self.exit_response();
+        InnerResponse::new(ret, response.unwrap())
+    }
+}
+
+impl Drop for ContextManager<'_> {
+    fn drop(&mut self) {
+        self.exit();
+    }
+}
+
+// ----------------------------------------------------------------------------
+
 /// This is what you use to place widgets.
 ///
 /// Represents a region of the screen with a type of layout (horizontal or vertical).
@@ -59,6 +115,12 @@ pub struct Ui {
 
     /// Indicates whether this Ui belongs to a Menu.
     menu_state: Option<Arc<RwLock<MenuState>>>,
+}
+
+impl Ui {
+    pub fn defer(&mut self, child: Ui, f: impl FnOnce(&mut ContextManager<'_>) + 'static) -> ContextManager<'_> {
+        ContextManager::new(f, self, child)
+    }
 }
 
 impl Ui {
@@ -809,6 +871,10 @@ impl Ui {
         self.allocate_ui_with_layout(desired_size, *self.layout(), add_contents)
     }
 
+    pub fn allocate_ui_ctx(&mut self, desired_size: Vec2) -> ContextManager<'_> {
+        self.allocate_ui_with_layout_ctx(desired_size, *self.layout())
+    }
+
     /// Allocated the given space and then adds content to that space.
     /// If the contents overflow, more space will be allocated.
     /// When finished, the amount of space actually used (`min_rect`) will be allocated.
@@ -829,27 +895,36 @@ impl Ui {
         layout: Layout,
         add_contents: Box<dyn FnOnce(&mut Self) -> R + 'c>,
     ) -> InnerResponse<R> {
+        let mut ctx = self.allocate_ui_with_layout_ctx(desired_size, layout);
+        ctx.exit_callback(add_contents)
+    }
+
+    pub fn allocate_ui_with_layout_ctx(
+        &mut self,
+        desired_size: Vec2,
+        layout: Layout,
+    ) -> ContextManager<'_> {
         crate::egui_assert!(desired_size.x >= 0.0 && desired_size.y >= 0.0);
         let item_spacing = self.spacing().item_spacing;
         let frame_rect = self.placer.next_space(desired_size, item_spacing);
         let child_rect = self.placer.justify_and_align(frame_rect, desired_size);
 
-        let mut child_ui = self.child_ui(child_rect, layout);
-        let ret = add_contents(&mut child_ui);
-        let final_child_rect = child_ui.min_rect();
+        let child_ui = self.child_ui(child_rect, layout);
+        self.defer(child_ui, move |ctx| {
+            let final_child_rect = ctx.ui.min_rect();
 
-        self.placer
-            .advance_after_rects(final_child_rect, final_child_rect, item_spacing);
+            ctx.parent.placer
+                .advance_after_rects(final_child_rect, final_child_rect, item_spacing);
 
-        if self.style().debug.debug_on_hover && self.rect_contains_pointer(final_child_rect) {
-            let painter = self.ctx().debug_painter();
-            painter.rect_stroke(frame_rect, 4.0, (1.0, Color32::LIGHT_BLUE));
-            painter.rect_stroke(final_child_rect, 4.0, (1.0, Color32::LIGHT_BLUE));
-            self.placer.debug_paint_cursor(&painter, "next");
-        }
+            if ctx.parent.style().debug.debug_on_hover && ctx.parent.rect_contains_pointer(final_child_rect) {
+                let painter = ctx.parent.ctx().debug_painter();
+                painter.rect_stroke(frame_rect, 4.0, (1.0, Color32::LIGHT_BLUE));
+                painter.rect_stroke(final_child_rect, 4.0, (1.0, Color32::LIGHT_BLUE));
+                ctx.parent.placer.debug_paint_cursor(&painter, "next");
+            }
 
-        let response = self.interact(final_child_rect, child_ui.id, Sense::hover());
-        InnerResponse::new(ret, response)
+            ctx.response = Some(ctx.parent.interact(final_child_rect, ctx.ui.id, Sense::hover()));
+        })
     }
 
     /// Allocated the given rectangle and then adds content to that rectangle.
@@ -861,19 +936,25 @@ impl Ui {
         max_rect: Rect,
         add_contents: impl FnOnce(&mut Self) -> R,
     ) -> InnerResponse<R> {
+        let mut ctx = self.allocate_ui_at_rect_ctx(max_rect);
+        ctx.exit_callback(add_contents)
+    }
+
+    pub fn allocate_ui_at_rect_ctx(
+        &mut self,
+        max_rect: Rect,
+    ) -> ContextManager<'_> {
         egui_assert!(max_rect.is_finite());
-        let mut child_ui = self.child_ui(max_rect, *self.layout());
-        let ret = add_contents(&mut child_ui);
-        let final_child_rect = child_ui.min_rect();
-
-        self.placer.advance_after_rects(
-            final_child_rect,
-            final_child_rect,
-            self.spacing().item_spacing,
-        );
-
-        let response = self.interact(final_child_rect, child_ui.id, Sense::hover());
-        InnerResponse::new(ret, response)
+        let child_ui = self.child_ui(max_rect, *self.layout());
+        self.defer(child_ui, |ctx| {
+            let final_child_rect = ctx.ui.min_rect();
+            ctx.parent.placer.advance_after_rects(
+                final_child_rect,
+                final_child_rect,
+                ctx.parent.spacing().item_spacing,
+            );
+            ctx.response = Some(ctx.parent.interact(final_child_rect, ctx.ui.id, Sense::hover()));
+        })
     }
 
     /// Convenience function to get a region to paint on.
@@ -1063,10 +1144,17 @@ impl Ui {
         enabled: bool,
         add_contents: impl FnOnce(&mut Ui) -> R,
     ) -> InnerResponse<R> {
-        self.scope(|ui| {
-            ui.set_enabled(enabled);
-            add_contents(ui)
-        })
+        let mut ctx = self.add_enabled_ui_ctx(enabled);
+        ctx.exit_callback(add_contents)
+    }
+
+    pub fn add_enabled_ui_ctx(
+        &mut self,
+        enabled: bool,
+    ) -> ContextManager<'_> {
+        let mut ctx = self.scope_ctx();
+        ctx.ui.set_enabled(enabled);
+        ctx
     }
 
     /// Add a single [`Widget`] that is possibly invisible.
@@ -1120,10 +1208,17 @@ impl Ui {
         visible: bool,
         add_contents: impl FnOnce(&mut Ui) -> R,
     ) -> InnerResponse<R> {
-        self.scope(|ui| {
-            ui.set_visible(visible);
-            add_contents(ui)
-        })
+        let mut ctx = self.add_visible_ui_ctx(visible);
+        ctx.exit_callback(add_contents)
+    }
+
+    pub fn add_visible_ui_ctx(
+        &mut self,
+        visible: bool,
+    ) -> ContextManager<'_> {
+        let mut ctx = self.scope_ctx();
+        ctx.ui.set_visible(visible);
+        ctx
     }
 
     /// Add extra space before the next widget.
@@ -1566,13 +1661,20 @@ impl Ui {
         &mut self,
         add_contents: Box<dyn FnOnce(&mut Ui) -> R + 'c>,
     ) -> InnerResponse<R> {
+        let mut ctx = self.scope_ctx();
+        ctx.exit_callback(add_contents)
+    }
+
+    pub fn scope_ctx(
+        &mut self,
+    ) -> ContextManager<'_> {
         let child_rect = self.available_rect_before_wrap();
         let next_auto_id_source = self.next_auto_id_source;
-        let mut child_ui = self.child_ui(child_rect, *self.layout());
+        let child_ui = self.child_ui(child_rect, *self.layout());
         self.next_auto_id_source = next_auto_id_source; // HACK: we want `scope` to only increment this once, so that `ui.scope` is equivalent to `ui.allocate_space`.
-        let ret = add_contents(&mut child_ui);
-        let response = self.allocate_rect(child_ui.min_rect(), Sense::hover());
-        InnerResponse::new(ret, response)
+        self.defer(child_ui, |ctx| {
+            ctx.response = Some(ctx.parent.allocate_rect(ctx.ui.min_rect(), Sense::hover()));
+        })
     }
 
     /// Redirect shapes to another paint layer.
@@ -1581,10 +1683,17 @@ impl Ui {
         layer_id: LayerId,
         add_contents: impl FnOnce(&mut Self) -> R,
     ) -> InnerResponse<R> {
-        self.scope(|ui| {
-            ui.painter.set_layer_id(layer_id);
-            add_contents(ui)
-        })
+        let mut ctx = self.with_layer_id_ctx(layer_id);
+        ctx.exit_callback(add_contents)
+    }
+
+    pub fn with_layer_id_ctx(
+        &mut self,
+        layer_id: LayerId,
+    ) -> ContextManager<'_> {
+        let mut ctx = self.scope_ctx();
+        ctx.ui.painter.set_layer_id(layer_id);
+        ctx
     }
 
     /// A [`CollapsingHeader`] that starts out collapsed.
@@ -1614,6 +1723,14 @@ impl Ui {
         id_source: impl Hash,
         add_contents: Box<dyn FnOnce(&mut Ui) -> R + 'c>,
     ) -> InnerResponse<R> {
+        let mut ctx = self.indent_ctx(id_source);
+        ctx.exit_callback(add_contents)
+    }
+
+    pub fn indent_ctx(
+        &mut self,
+        id_source: impl Hash,
+    ) -> ContextManager<'_> {
         assert!(
             self.layout().is_vertical(),
             "You can only indent vertical layouts, found {:?}",
@@ -1624,34 +1741,33 @@ impl Ui {
         let mut child_rect = self.placer.available_rect_before_wrap();
         child_rect.min.x += indent;
 
-        let mut child_ui = Self {
+        let child_ui = Self {
             id: self.id.with(id_source),
             ..self.child_ui(child_rect, *self.layout())
         };
-        let ret = add_contents(&mut child_ui);
+        self.defer(child_ui, move |ctx| {
+            let end_with_horizontal_line = ctx.parent.spacing().indent_ends_with_horizontal_line;
 
-        let end_with_horizontal_line = self.spacing().indent_ends_with_horizontal_line;
+            if end_with_horizontal_line {
+                ctx.ui.add_space(4.0);
+            }
 
-        if end_with_horizontal_line {
-            child_ui.add_space(4.0);
-        }
+            // draw a faint line on the left to mark the indented section
+            let stroke = ctx.parent.visuals().widgets.noninteractive.bg_stroke;
+            let left_top = child_rect.min - 0.5 * indent * Vec2::X;
+            let left_top = ctx.parent.painter().round_pos_to_pixels(left_top);
+            let left_bottom = pos2(left_top.x, ctx.ui.min_rect().bottom() - 2.0);
+            let left_bottom = ctx.parent.painter().round_pos_to_pixels(left_bottom);
+            ctx.parent.painter.line_segment([left_top, left_bottom], stroke);
+            if end_with_horizontal_line {
+                let fudge = 2.0; // looks nicer with button rounding in collapsing headers
+                let right_bottom = pos2(ctx.ui.min_rect().right() - fudge, left_bottom.y);
+                ctx.parent.painter
+                    .line_segment([left_bottom, right_bottom], stroke);
+            }
 
-        // draw a faint line on the left to mark the indented section
-        let stroke = self.visuals().widgets.noninteractive.bg_stroke;
-        let left_top = child_rect.min - 0.5 * indent * Vec2::X;
-        let left_top = self.painter().round_pos_to_pixels(left_top);
-        let left_bottom = pos2(left_top.x, child_ui.min_rect().bottom() - 2.0);
-        let left_bottom = self.painter().round_pos_to_pixels(left_bottom);
-        self.painter.line_segment([left_top, left_bottom], stroke);
-        if end_with_horizontal_line {
-            let fudge = 2.0; // looks nicer with button rounding in collapsing headers
-            let right_bottom = pos2(child_ui.min_rect().right() - fudge, left_bottom.y);
-            self.painter
-                .line_segment([left_bottom, right_bottom], stroke);
-        }
-
-        let response = self.allocate_rect(child_ui.min_rect(), Sense::hover());
-        InnerResponse::new(ret, response)
+            ctx.response = Some(ctx.parent.allocate_rect(ctx.ui.min_rect(), Sense::hover()));
+        })
     }
 
     /// Start a ui with horizontal layout.
@@ -1826,19 +1942,28 @@ impl Ui {
         layout: Layout,
         add_contents: Box<dyn FnOnce(&mut Self) -> R + 'c>,
     ) -> InnerResponse<R> {
-        let mut child_ui = self.child_ui(self.available_rect_before_wrap(), layout);
-        let inner = add_contents(&mut child_ui);
-        let rect = child_ui.min_rect();
-        let item_spacing = self.spacing().item_spacing;
-        self.placer.advance_after_rects(rect, rect, item_spacing);
+        let mut ctx = self.with_layout_ctx(layout);
+        ctx.exit_callback(add_contents)
+    }
 
-        if self.style().debug.debug_on_hover && self.rect_contains_pointer(rect) {
-            let painter = self.ctx().debug_painter();
-            painter.rect_stroke(rect, 4.0, (1.0, Color32::LIGHT_BLUE));
-            self.placer.debug_paint_cursor(&painter, "next");
-        }
+    pub fn with_layout_ctx(
+        &mut self,
+        layout: Layout,
+    ) -> ContextManager<'_> {
+        let child_ui = self.child_ui(self.available_rect_before_wrap(), layout);
+        self.defer(child_ui, |ctx| {
+            let rect = ctx.ui.min_rect();
+            let item_spacing = ctx.parent.spacing().item_spacing;
+            ctx.parent.placer.advance_after_rects(rect, rect, item_spacing);
 
-        InnerResponse::new(inner, self.interact(rect, child_ui.id, Sense::hover()))
+            if ctx.parent.style().debug.debug_on_hover && ctx.parent.rect_contains_pointer(rect) {
+                let painter = ctx.parent.ctx().debug_painter();
+                painter.rect_stroke(rect, 4.0, (1.0, Color32::LIGHT_BLUE));
+                ctx.parent.placer.debug_paint_cursor(&painter, "next");
+            }
+
+            ctx.response = Some(ctx.parent.interact(rect, ctx.ui.id, Sense::hover()))
+        })
     }
 
     /// This will make the next added widget centered and justified in the available space.
@@ -1900,6 +2025,12 @@ impl Ui {
         num_columns: usize,
         add_contents: Box<dyn FnOnce(&mut [Self]) -> R + 'c>,
     ) -> R {
+        // FIXME: there's no api for stashing multiple children onto ctx
+        /*
+        let mut ctx = self.columns_ctx(num_columns);
+        let result = add_contents(&mut columns[..]);
+        */
+
         // TODO: ensure there is space
         let spacing = self.spacing().item_spacing.x;
         let total_spacing = spacing * (num_columns as f32 - 1.0);
@@ -1935,6 +2066,50 @@ impl Ui {
         let size = vec2(self.available_width().max(total_required_width), max_height);
         self.advance_cursor_after_rect(Rect::from_min_size(top_left, size));
         result
+    }
+
+    // FIXME: ContextManager only handles one child UI, but columns has several
+    // FIXME: this method has no Response?
+    pub fn columns_ctx(
+        &mut self,
+        num_columns: usize,
+    ) -> ContextManager<'_> {
+        // TODO: ensure there is space
+        let spacing = self.spacing().item_spacing.x;
+        let total_spacing = spacing * (num_columns as f32 - 1.0);
+        let column_width = (self.available_width() - total_spacing) / (num_columns as f32);
+        let top_left = self.cursor().min;
+
+        let columns: Vec<Self> = (0..num_columns)
+            .map(|col_idx| {
+                let pos = top_left + vec2((col_idx as f32) * (column_width + spacing), 0.0);
+                let child_rect = Rect::from_min_max(
+                    pos,
+                    pos2(pos.x + column_width, self.max_rect().right_bottom().y),
+                );
+                let mut column_ui =
+                    self.child_ui(child_rect, Layout::top_down_justified(Align::LEFT));
+                column_ui.set_width(column_width);
+                column_ui
+            })
+            .collect();
+
+        // FIXME: this child_ui serves no purpose for now, my API just didn't support columns
+        let child_ui = self.child_ui(self.available_rect_before_wrap(), *self.layout());
+        self.defer(child_ui, move |ctx| {
+            let mut max_column_width = column_width;
+            let mut max_height = 0.0;
+            for column in &columns {
+                max_column_width = max_column_width.max(column.min_rect().width());
+                max_height = column.min_size().y.max(max_height);
+            }
+
+            // Make sure we fit everything next frame:
+            let total_required_width = total_spacing + max_column_width * (num_columns as f32);
+
+            let size = vec2(ctx.parent.available_width().max(total_required_width), max_height);
+            ctx.parent.advance_cursor_after_rect(Rect::from_min_size(top_left, size));
+        })
     }
 
     /// Close the menu we are in (including submenus), if any.

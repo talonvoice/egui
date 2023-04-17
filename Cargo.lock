@@ -1278,6 +1278,7 @@ dependencies = [
  "egui",
  "instant",
  "puffin",
+ "raw-window-handle",
  "serde",
  "smithay-clipboard",
  "tracing",

@@ -269,7 +269,7 @@ pub fn handle_app_output(
     }
 
     if let Some(window_size) = window_size {
-        window.set_inner_size(
+        let _ = window.request_inner_size(
             winit::dpi::PhysicalSize {
                 width: (current_pixels_per_point * window_size.x).round(),
                 height: (current_pixels_per_point * window_size.y).round(),
@@ -471,7 +471,7 @@ impl EpiIntegration {
     pub fn on_event(
         &mut self,
         app: &mut dyn epi::App,
-        event: &winit::event::WindowEvent<'_>,
+        event: &winit::event::WindowEvent,
     ) -> EventResponse {
         crate::profile_function!();
 

@@ -121,7 +121,7 @@ image = { version = "0.24", default-features = false, features = [
   "png",
 ] } # Needed for app icon
 raw-window-handle = { version = "0.5.0" }
-winit = { version = "0.28.1", default-features = false }
+winit = { version = "0.29.2", default-features = false, features = ["rwh_05"] }
 
 # optional native:
 directories-next = { version = "2", optional = true }
@@ -132,8 +132,8 @@ pollster = { version = "0.3", optional = true } # needed for wgpu
 
 # we can expose these to user so that they can select which backends they want to enable to avoid compiling useless deps.
 # this can be done at the same time we expose x11/wayland features of winit crate.
-glutin = { version = "0.30", optional = true }
-glutin-winit = { version = "0.3.0", optional = true }
+glutin = { version = "0.31", optional = true }
+glutin-winit = { version = "0.4.0", optional = true }
 puffin = { version = "0.16", optional = true }
 wgpu = { workspace = true, optional = true }
 
